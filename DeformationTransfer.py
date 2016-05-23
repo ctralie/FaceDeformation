@@ -12,11 +12,50 @@ from scipy.sparse.linalg import lsqr
 def loadBaselKeypointMesh():
     (VPos, VColors, ITris) = loadOffFileExternal("BUMesh.off")    
     return (VPos, ITris)
+
+class VideoMesh(object):
+    def __init__(self):
+        self.Frames = np.array([])
+        self.ITris = np.array([])
+
+    #Initialize the basel video with the first (neutral) frame filled in
+    #and the rest blank
+    def initBaselVideo(self, filename, NFrames):
+        (a, b, self.ITris) = loadOffFileExternal("BUMesh.off")
+        #Grab the keypoints of the chosen basel model
+        shape = sio.loadmat(filename)['shape']
+        shape = np.reshape(shape, [len(shape)/3, 3])
+        idx = sio.loadmat("BaselBUKeypointsIdx")['idx']-1
+        idx = idx.flatten()
+        shape = shape[idx, :]
+        self.Frames = np.zeros((NFrames, shape.shape[0], shape.shape[1]))
+        self.Frames[0, :, :] = shape
     
-#Parit:load Meshidx and mesh of statue
-def loadBUTris():
-    ITris = sio.loadmat("BaselTris.mat")['ITris']
-    return ITris
+    #Load in a bunch of bnd files, assuming the first one is a neutral
+    #expression
+    def initBUVideo(self, paths):
+        (a, b, self.ITris) = loadOffFileExternal("BUMesh.off")
+        X1 = np.loadtxt(paths[0])
+        X1 = X1[:, 1::]
+        NFrames = len(paths)
+        self.Frames = np.zeros((NFrames, X1.shape[0], X1.shape[1]))
+        self.Frames[0, :, :] = X1
+        for i in range(1, NFrames):
+            X = np.loadtxt(paths[i])
+            X = X[:, 1::]
+            self.Frames[i, :, :] = X
+    
+    def saveFramesOff(self, prefix):
+        for i in range(self.Frames.shape[0]):
+            VPos = self.Frames[i, :, :]
+            fout = open("%s%i.off"%(prefix, i), "w")
+            fout.write("OFF\n%i %i 0\n"%(VPos.shape[0], self.ITris.shape[0]))
+            for i in range(VPos.shape[0]):
+                fout.write("%g %g %g\n"%(VPos[i, 0], VPos[i, 1], VPos[i, 2]))
+            for i in range(self.ITris.shape[0]):
+                fout.write("3 %g %g %g\n"%(self.ITris[i, 0], self.ITris[i, 1], self.ITris[i, 2]))
+            fout.close()
+        
 
 def getLaplacianMatrixCotangent(mesh, anchorsIdx, anchorWeights = 1):
     VPos = mesh.VPos
@@ -84,65 +123,40 @@ def solveLaplacianMesh(mesh, anchors, anchorsIdx):
         mesh.VPos[:, k] = lsqr(L, delta[:, k])[0]
     mesh.saveFile("out.off")
 
-class VideoMesh(object):
-    def __init__(self):
-        self.Frames = np.array([])
-    
-    def initStaticVideo(VPosInitial):
-        self.Frames = np.array(VPosInitial)
-        self.Frames = np.reshape(self.Frames, (1, self.Frames.shape[0], self.Frames.shape[1]))
-
-class DeformationTranferer:
+class DeformationTransferer:
     def __init__(self, origVideo, warpedVideo):
         self.origVideo = origVideo
         self.warpedVideo = warpedVideo
         self.origFrames = self.origVideo.Frames
         self.warpedFrames = self.warpedVideo.Frames
-        self.origMesh = self.origVideo.m
-        self.warpedMesh = self.warpedVideo.m
         self.NFrames = self.origFrames.shape[0]
-        self.NFaces = len(self.origMesh.faces)
-        assert self.origFrames.shape[1] == len(self.origMesh.vertices) \
-               and len(self.origMesh.vertices) == len(self.warpedMesh.vertices) \
-               and len(self.warpedMesh.vertices) == self.warpedFrames.shape[1] \
-               and len(self.origMesh.faces) == len(self.warpedMesh.faces)
+        self.ITris = self.origVideo.ITris
+        self.NFaces = self.ITris.shape[0]
 
         self.count = 0
         self.NVertices = self.origFrames.shape[1]
         self.NVertices4 = self.NVertices + self.NFaces #original vertices plus 1 new vertex (4th vector) for each face
-        self.origMesh.updateTris()
-        self.warpedMesh.updateTris()
-        self.origTris = self.origMesh.ITris
-        self.warpedTris = self.warpedMesh.ITris
-        assert self.origTris.shape[0] == self.warpedTris.shape[0]
         # Tris4 is Tris plus 4th col indexing 4th vector (which should be mapped to the N to N+F-1 index of VPos4)
-        self.origTris4 = np.hstack((self.origTris,
-                                    np.reshape(np.arange(self.NVertices, self.NVertices4), (self.NFaces, 1))))
-        self.warpedTris4 = np.hstack((self.warpedTris,
+        self.Tris4 = np.hstack((self.ITris,
                                     np.reshape(np.arange(self.NVertices, self.NVertices4), (self.NFaces, 1))))
         print "#####debug info: initial values#########"
         print "origFrame shape (NFrames x NVertices x 3):", self.origFrames.shape
         print "warpedFrame shape (NFrames x NVertices x 3): ", self.warpedFrames.shape
-        print "origMesh number of vertices:", len(self.origMesh.vertices)
-        print "warpedMesh number of vertices:", len(self.warpedMesh.vertices)
-        print "origMesh number of faces:", len(self.origMesh.faces)
-        print "warpedMesh number of faces:", len(self.warpedMesh.faces)
-        print "origMesh ITris shape:", self.origMesh.ITris.shape
-        print "warpedMesh ITris shape:", self.warpedMesh.ITris.shape
+        print "ITris shape:", self.ITris.shape
         print "#####end: initial values#########"
 
     def beginDeformationTransfer(self):
         resultFrames = np.empty([self.NFrames, self.NVertices, 3])  # this is result array to fill in
         resultFrames[0, :, :] = self.warpedFrames[0, :, :]
-        origOldVPos4 = self.getVPos4(self.origFrames[0, :, :], self.origTris)  # old VPos with extra NFaces vectors
-        warpedOldVPos4 = self.getVPos4(self.warpedFrames[0, :, :], self.warpedTris)
+        origOldVPos4 = self.getVPos4(self.origFrames[0, :, :], self.ITris)  # old VPos with extra NFaces vectors
+        warpedOldVPos4 = self.getVPos4(self.warpedFrames[0, :, :], self.ITris)
         for i in range(1, self.NFrames):
             # 1 orig: get newVPos4
-            origNewVPos4 = self.getVPos4(self.origFrames[i, :, :], self.origTris)
+            origNewVPos4 = self.getVPos4(self.origFrames[i, :, :], self.ITris)
             # 2 orig: use old and new VPos4 to get S-matrix which shape is 3 x 3NFaces
-            S = self.getSMatrix(origOldVPos4, origNewVPos4, self.origTris4)
+            S = self.getSMatrix(origOldVPos4, origNewVPos4, self.Tris4)
             # 3 warped: use old VPos4 to get A (coefficient) sparse matrix which shape is 3NFaces x NVertices
-            A = self.getAMatrix(warpedOldVPos4, self.warpedTris4)
+            A = self.getAMatrix(warpedOldVPos4, self.Tris4)
             origOldVPos4 = origNewVPos4
             warpedOldVPos4[:, 0] = lsqr(A, S[0, :])[0]
             warpedOldVPos4[:, 1] = lsqr(A, S[1, :])[0]
@@ -229,43 +243,25 @@ class DeformationTranferer:
         A = sparse.coo_matrix((V, (I, J)), shape = (3 * self.NFaces, self.NVertices4)).tocsr()
         return A
 
-class VideoMesh(object):
-    def __init__(self, initialMeshFilename):
-        self.m = PolyMesh()
-        self.m.loadFile(initialMeshFilename)
-        if( (initialMeshFilename == 'NotreDameFrontHalfMouthCut.off')):
-            self.m.VPos[:,2] = -self.m.VPos[:,2]
-            self.m.needsDisplayUpdate = True
-
-        #Frames is an NFrames x NVertices x 3 array of vertices for the
-        #mesh video
-        #By default, just make a video with one frame as the initial mesh
-        #position
-        #Jay: here it's taking the VPos (a list of position of every vertex) and make it the 1-frame frame
-        self.Frames = np.array(self.m.VPos)
-        self.Frames = np.reshape(self.Frames, (1, self.Frames.shape[0], self.Frames.shape[1]))
-        self.bbox = BBox3D()
-        self.bbox.fromPoints(self.m.VPos)
-    
-    def loadVideo(self, videoFilename):
-        self.Frames = sio.loadmat(videoFilename)['Frames']
-
-    def doTransfer(self):
-        return
-
-    def drawFrame(self, idx, displayMeshEdges, displayMeshPoints, displayMeshFaces):
-        if idx >= self.Frames.shape[0]:
-            #If beyond the end of the video, just play the last frame
-            idx = self.Frames.shape[0]-1
-        self.m.VPos = self.Frames[idx, :, :]
-        self.m.needsDisplayUpdate = True
-        self.m.renderGL(displayMeshEdges, displayMeshPoints, displayMeshFaces, False, False, True, False)
 
 if __name__ == '__main__':
-    #Load the original video of Chris talking with the candide mesh
-    #over his face geometry
-    self.origVideo = VideoMesh('candide.off')
-    self.origVideo.loadVideo('SpeechVideo1.mat')
-    #Load the first candide frame
-    self.warpedVideo = VideoMesh('StatueCandide.off')
-    #TODO: You can have a look at the data structures here
+    #Load in BU bnd files
+    buVideo = VideoMesh()
+    buVideo.initBUVideo(["bu3/F0012/F0012_AN01WH_F3D.bnd", "bu3/F0012/F0012_HA04WH_F3D.bnd"])
+    NFrames = buVideo.Frames.shape[0]
+    
+    #Load in basel mesh
+    baselVertsFile = "BaselVerts.mat"
+    ITris = sio.loadmat("BaselTris.mat")['ITris']
+    VPos = sio.loadmat(baselVertsFile)['shape']
+    VPos = np.reshape(VPos, [3, len(VPos)/3]).T
+    
+    #Create basel video placeholder
+    baselVideo = VideoMesh()
+    baselVideo.initBaselVideo(baselVertsFile, NFrames)
+    
+    #Do coarse deformation transfer
+    T = DeformationTransferer(buVideo, baselVideo)
+    T.beginDeformationTransfer()
+    
+    baselVideo.saveFramesOff("Basel")
