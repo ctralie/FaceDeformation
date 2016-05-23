@@ -1,17 +1,100 @@
 #Code by Chris Tralie, Parit Burintrathikul, Justin Wang, Lydia Xu, Billy Wan, and Jay Wang
 import sys
-sys.path.append("S3DGLPy")
-from Primitives3D import *
-from PolyMesh import *
 import numpy as np
 from scipy import sparse
 import scipy.io as sio
 from scipy.linalg import norm
 from scipy.sparse.linalg import lsqr
 
+def saveOffFileExternal(filename, VPos, VColors, ITris):
+    #Save off file given buffers, not necessarily in the PolyMesh object
+    nV = VPos.shape[0]
+    nF = ITris.shape[0]
+    fout = open(filename, "w")
+    if VColors.size == 0:
+        fout.write("OFF\n%i %i %i\n"%(nV, nF, 0))
+    else:
+        fout.write("COFF\n%i %i %i\n"%(nV, nF, 0))
+    for i in range(nV):
+        fout.write("%g %g %g"%tuple(VPos[i, :]))
+        if VColors.size > 0:
+            fout.write(" %g %g %g"%tuple(VColors[i, :]))
+        fout.write("\n")
+    for i in range(nF):
+        fout.write("3 %i %i %i\n"%tuple(ITris[i, :]))
+    fout.close()
+
+#Return VPos, VColors, and ITris without creating any structure
+#(Assumes triangle mesh)
+def loadOffFileExternal(filename):
+    fin = open(filename, 'r')
+    nVertices = 0
+    nFaces = 0
+    lineCount = 0
+    face = 0
+    vertex = 0
+    divideColor = False
+    VPos = np.zeros((0, 3))
+    VColors = np.zeros((0, 3))
+    ITris = np.zeros((0, 3))
+    for line in fin:
+        lineCount = lineCount+1
+        fields = line.split() #Splits whitespace by default
+        if len(fields) == 0: #Blank line
+            continue
+        if fields[0][0] in ['#', '\0', ' '] or len(fields[0]) == 0:
+            continue
+        #Check section
+        if nVertices == 0:
+            if fields[0] == "OFF" or fields[0] == "COFF":
+                if len(fields) > 2:
+                    fields[1:4] = [int(field) for field in fields]
+                    [nVertices, nFaces, nEdges] = fields[1:4]  
+                    print "nVertices = %i, nFaces = %i"%(nVertices, nFaces)
+                    #Pre-allocate vertex arrays    
+                    VPos = np.zeros((nVertices, 3)) 
+                    VColors = np.zeros((nVertices, 3))
+                    ITris = np.zeros((nFaces, 3))
+                if fields[0] == "COFF":
+                    divideColor = True            
+            else:
+                fields[0:3] = [int(field) for field in fields]
+                [nVertices, nFaces, nEdges] = fields[0:3]
+                VPos = np.zeros((nVertices, 3)) 
+                VColors = np.zeros((nVertices, 3))
+                ITris = np.zeros((nFaces, 3))
+        elif vertex < nVertices:
+            fields = [float(i) for i in fields]
+            P = [fields[0],fields[1], fields[2]]
+            color = np.array([0.5, 0.5, 0.5]) #Gray by default
+            if len(fields) >= 6:
+                #There is color information
+                if divideColor:
+                    color = [float(c)/255.0 for c in fields[3:6]]
+                else:
+                    color = [float(c) for c in fields[3:6]]
+            VPos[vertex, :] = P
+            VColors[vertex, :] = color
+            vertex = vertex+1
+        elif face < nFaces:
+            #Assume the vertices are specified in CCW order
+            fields = [int(i) for i in fields]
+            ITris[face, :] = fields[1:fields[0]+1]
+            face = face+1
+    fin.close()
+    VPos = np.array(VPos, np.float64)
+    VColors = np.array(VColors, np.float64)
+    ITris = np.array(ITris, np.int32)
+    return (VPos, VColors, ITris) 
+
 def loadBaselKeypointMesh():
     (VPos, VColors, ITris) = loadOffFileExternal("BUMesh.off")    
     return (VPos, ITris)
+
+def getBaselBUKeypointsIdx():
+    idx = sio.loadmat("BaselBUKeypointsIdx")['idx']-1
+    idx = idx.flatten()
+    return idx
 
 class VideoMesh(object):
     def __init__(self):
@@ -25,8 +108,7 @@ class VideoMesh(object):
         #Grab the keypoints of the chosen basel model
         shape = sio.loadmat(filename)['shape']
         shape = np.reshape(shape, [len(shape)/3, 3])
-        idx = sio.loadmat("BaselBUKeypointsIdx")['idx']-1
-        idx = idx.flatten()
+        idx = getBaselBUKeypointsIdx()
         shape = shape[idx, :]
         self.Frames = np.zeros((NFrames, shape.shape[0], shape.shape[1]))
         self.Frames[0, :, :] = shape
@@ -57,9 +139,7 @@ class VideoMesh(object):
             fout.close()
         
 
-def getLaplacianMatrixCotangent(mesh, anchorsIdx, anchorWeights = 1):
-    VPos = mesh.VPos
-    ITris = mesh.ITris
+def getLaplacianMatrixCotangent(VPos, ITris, anchorsIdx, anchorWeights = 1):
     N = VPos.shape[0]
     M = ITris.shape[0]
     #Allocate space for the sparse array storage, with 2 entries for every
@@ -114,14 +194,17 @@ def getLaplacianMatrixCotangent(mesh, anchorsIdx, anchorWeights = 1):
     L = sparse.coo_matrix((V, (I, J)), shape=(N+len(anchorsIdx), N)).tocsr()
     return L
 
-def solveLaplacianMesh(mesh, anchors, anchorsIdx):
-    N = mesh.VPos.shape[0]
-    L = getLaplacianMatrixCotangent(mesh, anchorsIdx)
-    delta = L.dot(mesh.VPos)
+def solveLaplacianMesh(VPos, ITris, anchorsIdx, anchors):
+    N = VPos.shape[0]
+    L = getLaplacianMatrixCotangent(VPos, ITris, anchorsIdx)
+    delta = L.dot(VPos)
     delta[N:, :] = anchors
+    sio.savemat("System.mat", {"L":L, "delta":delta})
+    VPosNew = np.zeros((N, 3))
     for k in range(3):
-        mesh.VPos[:, k] = lsqr(L, delta[:, k])[0]
-    mesh.saveFile("out.off")
+        print "Solving Laplacian mesh coordinates %i of %i..."%(k+1, 3)
+        VPosNew[:, k] = lsqr(L, delta[:, k])[0]
+    return VPosNew
 
 class DeformationTransferer:
     def __init__(self, origVideo, warpedVideo):
@@ -254,7 +337,7 @@ if __name__ == '__main__':
     baselVertsFile = "BaselVerts.mat"
     ITris = sio.loadmat("BaselTris.mat")['ITris']
     VPos = sio.loadmat(baselVertsFile)['shape']
-    VPos = np.reshape(VPos, [3, len(VPos)/3]).T
+    VPos = np.reshape(VPos, [len(VPos)/3, 3])
     
     #Create basel video placeholder
     baselVideo = VideoMesh()
@@ -263,5 +346,12 @@ if __name__ == '__main__':
     #Do coarse deformation transfer
     T = DeformationTransferer(buVideo, baselVideo)
     T.beginDeformationTransfer()
-    
+    #Save coarse frames to hard drive
     baselVideo.saveFramesOff("Basel")
+    
+    #Do fine deformation transfer with Laplacian mesh using coarse
+    #vertices as anchors
+    idx = getBaselBUKeypointsIdx()
+    L = getLaplacianMatrixCotangent(VPos, ITris, idx)
+    VPosNew = solveLaplacianMesh(VPos, ITris, idx, baselVideo.Frames[1, :, :])
+    saveOffFileExternal("BaselTransfer.off", VPosNew, np.array([]), ITris)
